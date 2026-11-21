@@ -1,0 +1,16 @@
+{
+  "name": "coupon-finder-server",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch index.js",
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.7.0",
+    "cheerio": "^1.0.0",
+    "coupon-finder": "file:..",
+    "express": "^4.21.2"
+  }
+}

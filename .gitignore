@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.log
+
+# local database — personal search history/favorites stay off GitHub
+server/coupons.db
+server/coupons.db-wal
+server/coupons.db-shm
