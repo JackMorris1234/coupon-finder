@@ -32,6 +32,7 @@ seconds as on desktop.
 - **Company lookup** — the search box autocompletes company names to domains via Clearbit's free suggest endpoint.
 - **Sources** — three scrapers run in parallel (`server/scrapers/`): PromoCodes.com (full copyable codes + verification/expiry data from its embedded Next.js state), CouponFollow and DealDrop (offer listings; their codes are click-to-reveal on the source site). A source that fails or blocks is skipped and a banner notes it.
 - **Verification status** — codes can't be test-applied at most retailers' checkouts (bot protection, requires a real cart session), so a code is marked **✓ Verified** when a source validated it within the last 30 days or the same offer appears on multiple sources, and **? Unconfirmed** when it couldn't be auto-checked. Expired codes are dropped. The logic lives in `server/scrapers/index.js` (`assignStatus`) and is pluggable if you later add per-site live checkers.
+- **Weekly flyers & grocery savings** — the Weekly flyers tab searches current circulars near your ZIP (Flipp), or shows a specific store's whole flyer when you type its name. Local chains Flipp doesn't carry (e.g. Donelan's) are covered via their Freshop APIs — including **unadvertised in-store specials** beyond the printed ad.
 - **Caching** — results are stored in SQLite (`server/coupons.db`) and reused for 6 hours; **⟳ Refresh & re-check** forces a fresh scrape and re-runs verification.
 - **History & favorites** — recent searches and starred companies persist in the same database.
 

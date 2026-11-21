@@ -125,8 +125,43 @@ async function freshopFlyer(appKey) {
       validFrom: circular.start_date ?? null,
       validTo: p.sale_finish_date ?? circular.finish_date ?? null,
     }));
+
+  // Beyond the printed ad, /1/offers lists every active markdown; the ones
+  // without circular_ids are unadvertised in-store specials — extra savings
+  // the flyer never shows. They carry name/price/dates directly.
+  try {
+    const offers = await fetchJson(`https://api.freshop.com/1/offers?app_key=${appKey}&store_id=${store.id}&limit=200`);
+    const seen = new Set(items.map((i) => i.name.toLowerCase()));
+    const nowMs = Date.now();
+    for (const o of offers.items ?? []) {
+      if (!o.name || o.is_suppressed || o.circular_ids?.length) continue;
+      if (seen.has(o.name.toLowerCase())) continue;
+      const finish = toTsSafe(o.finish_date);
+      if (finish && finish < nowMs) continue;
+      seen.add(o.name.toLowerCase());
+      items.push({
+        name: o.name,
+        merchant: store.name,
+        merchantLogo: null,
+        price: o.config?.price ?? (Number(String(o.sale_price ?? '').replace(/[^0-9.]/g, '')) || null),
+        originalPrice: null,
+        prePriceText: null,
+        postPriceText: null,
+        saleStory: o.sale_price_disclaimer || 'unadvertised special',
+        image: null,
+        validFrom: o.start_date ?? null,
+        validTo: o.finish_date ?? null,
+      });
+    }
+  } catch { /* specials are best-effort; circular items already collected */ }
+
   return { items, merchant: store.name, total: items.length };
 }
+
+const toTsSafe = (v) => {
+  const ts = v ? Date.parse(v) : NaN;
+  return Number.isFinite(ts) ? ts : null;
+};
 
 async function fetchJson(url) {
   const res = await fetch(url, {

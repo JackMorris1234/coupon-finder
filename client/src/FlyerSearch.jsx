@@ -100,6 +100,7 @@ export function FlyerCard({ item }) {
     <article className="card flyer-card">
       {item.image && <img className="flyer-img" src={item.image} alt="" loading="lazy" />}
       <h4>{item.name}</h4>
+      {amount && item.saleStory && <p className="desc">{item.saleStory}</p>}
       <div className="card-bottom">
         <div className="deal-chips">
           {price && <span className="discount">{price}</span>}
