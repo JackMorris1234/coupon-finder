@@ -5,7 +5,7 @@ import * as couponscom from './couponscom.js';
 import * as savingscom from './savingscom.js';
 import * as dontpayfull from './dontpayfull.js';
 import * as dealhack from './dealhack.js';
-import { emptyTelemetry, mergeTelemetry, scoreOffer, statusFromBand } from './confidence.js';
+import { mergeTelemetry, scoreOffer, statusFromBand, telemetryFor } from './confidence.js';
 
 const ADAPTERS = [promocodes, couponfollow, dealdrop, couponscom, savingscom, dontpayfull, dealhack];
 
@@ -40,11 +40,7 @@ async function scrapeWithSlugs(adapter, domain, slugs) {
 // protection, and automated code-testing is the abuse pattern those defenses
 // exist to stop). Instead we pool the telemetry the sources publish about real
 // shopper redemptions and score it — see confidence.js.
-const withSource = (offer) => {
-  const telemetry = { ...emptyTelemetry(), ...(offer.telemetry ?? {}) };
-  if (!telemetry.sources?.length) telemetry.sources = [offer.source];
-  return telemetry;
-};
+const withSource = (offer) => telemetryFor(offer.source, offer.telemetry ?? {});
 
 export async function scrapeAll(domain, name) {
   const slugs = slugCandidates(domain, name);
@@ -65,8 +61,10 @@ export async function scrapeAll(domain, name) {
   const offers = [];
   const errors = [];
   results.forEach((r, i) => {
+    // A rejected code still means the source HAS a code it didn't hand over,
+    // so the offer stays click-to-reveal rather than becoming a "deal".
     if (r.status === 'fulfilled') offers.push(...r.value.map((o) => (
-      o.code && !isRealCode(o.code) ? { ...o, code: null } : o
+      o.code && !isRealCode(o.code) ? { ...o, code: null, hasHiddenCode: true } : o
     )));
     else {
       const message = String(r.reason?.message ?? r.reason);
@@ -101,18 +99,8 @@ export async function scrapeAll(domain, name) {
 
   const nowMs = Date.now();
   const scored = [...byKey.values()].map((offer) => {
-    const { confidence, band, evidence, lastWorkedAt, sourceCount } = scoreOffer(offer, nowMs);
-    return {
-      ...offer,
-      confidence,
-      band,
-      evidence,
-      lastWorkedAt,
-      sourceCount,
-      attempts: offer.telemetry?.attempts ?? 0,
-      successes: offer.telemetry?.successes ?? 0,
-      status: statusFromBand(band),
-    };
+    const result = scoreOffer(offer, nowMs);
+    return { ...offer, ...result, status: statusFromBand(result.band) };
   });
 
   return { offers: scored, errors };

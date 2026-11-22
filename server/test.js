@@ -2,7 +2,7 @@
 // --fast skips the live scrape-pipeline tests (used between small refactors);
 // a full run exercises every feature against live sources + the running API.
 import { groupSuggestions } from './resolve.js';
-import { scoreOffer, emptyTelemetry, wilsonLowerBound, mergeTelemetry } from './scrapers/confidence.js';
+import { scoreOffer, wilsonLowerBound, mergeTelemetry, telemetryFor } from './scrapers/confidence.js';
 
 const FAST = process.argv.includes('--fast');
 const API = 'http://localhost:3001';
@@ -64,47 +64,133 @@ function check(name, ok, detail = '') {
 }
 
 // ---- confidence scoring (pure) ----
+// Most of these encode a specific defect found by adversarial review; the
+// comment names what regressing would re-break.
 {
   const now = Date.now();
   const ago = (days) => now - days * 24 * 60 * 60 * 1000;
-  const T = (o) => ({ ...emptyTelemetry(), ...o });
+  const T = telemetryFor;
   const score = (offer) => scoreOffer(offer, now);
 
   check('wilson: large sample beats lucky small one',
     wilsonLowerBound(271, 465) > wilsonLowerBound(1, 1));
   check('wilson: null on zero attempts', wilsonLowerBound(0, 0) === null);
 
-  const strong = score({ code: 'A', telemetry: T({ attempts: 465, successes: 271, lastSuccessAt: ago(0.2), sources: ['x', 'y', 'z'] }) });
+  const strong = score({ code: 'A', telemetry: T('DealHack', { attempts: 465, successes: 271, lastSuccessAt: ago(0.2) }) });
   check('score: strong recent code is high band', strong.band === 'high' && strong.confidence >= 70,
     `${strong.confidence}/${strong.band}`);
 
-  const dead = score({ code: 'B', telemetry: T({ attempts: 360, successes: 1, lastSuccessAt: ago(3), sources: ['x'] }) });
+  const dead = score({ code: 'B', telemetry: T('x', { attempts: 360, successes: 1, lastSuccessAt: ago(3) }) });
   check('score: 1-of-360 is poor band', dead.band === 'poor' && dead.confidence < 20,
     `${dead.confidence}/${dead.band}`);
 
-  // The central honesty guard: never call a code bad without a real sample.
-  const thin = score({ code: 'C', telemetry: T({ attempts: 5, successes: 0, lastVerifiedAt: ago(5), sources: ['x'] }) });
-  check('score: small bad sample is never labelled poor', thin.band === 'unknown',
-    `${thin.confidence}/${thin.band}`);
+  // Core honesty guard: never call a code bad without a real sample.
+  const thin = score({ code: 'C', telemetry: T('x', { attempts: 5, successes: 0, lastVerifiedAt: ago(5) }) });
+  check('score: small bad sample is never labelled poor', thin.band === 'unknown', `${thin.confidence}/${thin.band}`);
 
-  const lucky = score({ code: 'D', telemetry: T({ attempts: 1, successes: 1, lastSuccessAt: ago(1), sources: ['x'] }) });
+  const lucky = score({ code: 'D', telemetry: T('x', { attempts: 1, successes: 1, lastSuccessAt: ago(1) }) });
   check('score: lucky 1-of-1 is not crowned high', lucky.band !== 'high', `${lucky.confidence}/${lucky.band}`);
 
-  const blank = score({ code: 'E', telemetry: T({ sources: ['x'] }) });
+  const blank = score({ code: 'E', telemetry: T('x', {}) });
   check('score: no telemetry stays unknown, not poor', blank.band === 'unknown', blank.band);
   check('score: no telemetry outranks a demonstrably dead code', blank.confidence > dead.confidence);
 
-  const deal = score({ code: null, telemetry: T({ attempts: 100, successes: 0, sources: ['x'] }) });
+  const deal = score({ code: null, telemetry: T('x', { attempts: 100, successes: 0 }) });
   check('score: code-less deals are never labelled poor', deal.band !== 'poor', deal.band);
 
-  const pooled = mergeTelemetry(
-    T({ attempts: 465, successes: 271, lastSuccessAt: ago(5), sources: ['DealHack'] }),
-    T({ attempts: 360, successes: 1, lastSuccessAt: ago(1), sources: ['CouponFollow'] })
+  // Monotonicity: adding positive evidence must never lower the score.
+  const priorOnly = score({ code: 'F', telemetry: T('DealHack', { sourceScore: 92, sourceConfidence: 0.9, lastSuccessAt: ago(1) }) });
+  const priorPlus = score({
+    code: 'F',
+    telemetry: mergeTelemetry(
+      T('DealHack', { sourceScore: 92, sourceConfidence: 0.9, lastSuccessAt: ago(1) }),
+      T('CouponFollow', { attempts: 2, successes: 2, lastSuccessAt: ago(1) })
+    ),
+  });
+  check('score: positive evidence never lowers confidence',
+    priorPlus.confidence >= priorOnly.confidence - 2 && priorPlus.band !== 'unknown',
+    `${priorOnly.confidence}/${priorOnly.band} -> ${priorPlus.confidence}/${priorPlus.band}`);
+
+  // Syndication: sources republish each other's counts, so never sum them.
+  const syndicated = mergeTelemetry(
+    T('CouponFollow', { attempts: 389, successes: 1, lastSuccessAt: ago(1) }),
+    T('DealHack', { attempts: 389, successes: 1, lastSuccessAt: ago(1) })
   );
-  check('merge: pools counts across sources', pooled.attempts === 825 && pooled.successes === 272,
-    `${pooled.successes}/${pooled.attempts}`);
-  check('merge: keeps the most recent success', pooled.lastSuccessAt === ago(1));
-  check('merge: unions source names', pooled.sources.length === 2);
+  const synScore = score({ code: 'G', telemetry: syndicated });
+  check('merge: identical counts across sources are not summed', synScore.attempts === 389, String(synScore.attempts));
+
+  // One site listing the same code twice must not manufacture a sample.
+  const selfPooled = mergeTelemetry(
+    T('CouponFollow', { attempts: 12, successes: 1, lastSuccessAt: ago(2) }),
+    T('CouponFollow', { attempts: 12, successes: 1, lastSuccessAt: ago(2) })
+  );
+  const selfScore = score({ code: 'H', telemetry: selfPooled });
+  check('merge: same source twice does not double the sample',
+    selfScore.attempts === 12 && selfScore.band !== 'poor', `${selfScore.attempts}/${selfScore.band}`);
+
+  // Impossible and malformed counts must not escape into the UI.
+  const impossible = score({ code: 'I', telemetry: T('x', { attempts: 25, successes: 30, lastSuccessAt: ago(1) }) });
+  const impossiblePct = Number(impossible.evidence.match(/(\d+)%/)?.[1] ?? 0);
+  check('score: successes are clamped to attempts',
+    impossiblePct <= 100 && impossible.successes <= impossible.attempts, impossible.evidence);
+  const negative = score({ code: 'J', telemetry: T('x', { attempts: 25, successes: -3, lastSuccessAt: ago(1) }) });
+  check('score: negative counts do not produce negative percentages', !negative.evidence.includes('-'), negative.evidence);
+  const nan = score({ code: 'K', telemetry: T('x', { sourceScore: NaN, lastSuccessAt: ago(1) }) });
+  check('score: NaN never reaches confidence', Number.isFinite(nan.confidence) && !nan.evidence.includes('NaN'),
+    `${nan.confidence} ${nan.evidence}`);
+
+  // Staleness is not failure, and failure is not staleness.
+  const oldGood = score({ code: 'L', telemetry: T('x', { attempts: 1000, successes: 350, lastSuccessAt: ago(91) }) });
+  check('score: age alone never produces the poor band', oldGood.band !== 'poor', `${oldGood.confidence}/${oldGood.band}`);
+  const ancient = score({ code: 'M', telemetry: T('x', { attempts: 465, successes: 271, lastSuccessAt: ago(365) }) });
+  check('score: year-old evidence is not affirmed', ancient.band === 'unknown', `${ancient.confidence}/${ancient.band}`);
+
+  // Badge and evidence sentence must never contradict each other.
+  const nineteen = score({ code: 'N', telemetry: T('x', { attempts: 19, successes: 19, lastSuccessAt: ago(1) }) });
+  check('score: confident badge never sits beside "too few to judge"',
+    !(nineteen.band === 'high' && /too few/.test(nineteen.evidence)), `${nineteen.band} ${nineteen.evidence}`);
+
+  // A big sample must not be capped just because no timestamp came with it.
+  const undated = score({ code: 'O', telemetry: T('x', { attempts: 465, successes: 271 }) });
+  check('score: undated large sample is not forced to unknown', undated.band !== 'unknown',
+    `${undated.confidence}/${undated.band}`);
+
+  // Self-reported badges alone must not reach the strongest claim.
+  const badgesOnly = mergeTelemetry(
+    mergeTelemetry(T('a', { declaredVerified: true, lastVerifiedAt: ago(1) }), T('b', { declaredVerified: true, lastVerifiedAt: ago(1) })),
+    mergeTelemetry(T('c', { declaredVerified: true, lastVerifiedAt: ago(1) }), T('d', { declaredVerified: true, lastVerifiedAt: ago(1) }))
+  );
+  const badgeScore = score({ code: 'P', telemetry: badgesOnly });
+  check('score: verified badges alone never reach the "Works" band', badgeScore.band !== 'high',
+    `${badgeScore.confidence}/${badgeScore.band}`);
+
+  // Corroboration must not affirm what the sample refuses to.
+  const thinCorroborated = score({
+    code: 'Q',
+    telemetry: mergeTelemetry(
+      mergeTelemetry(T('a', { attempts: 1, successes: 0, lastVerifiedAt: ago(1) }), T('b', { attempts: 1, successes: 0 })),
+      mergeTelemetry(T('c', { attempts: 1, successes: 0 }), T('d', { attempts: 1, successes: 0 }))
+    ),
+  });
+  check('score: corroboration cannot affirm an all-failure sample', thinCorroborated.band === 'unknown',
+    `${thinCorroborated.confidence}/${thinCorroborated.band}`);
+
+  // A source disclaiming its own score must not sink below having no data.
+  const disclaimed = score({ code: 'R', telemetry: T('x', { sourceScore: 95, sourceConfidence: 0, lastSuccessAt: ago(1) }) });
+  const nothing = score({ code: 'S', telemetry: T('x', { lastSuccessAt: ago(1) }) });
+  check('score: a disclaimed works-score is not worse than no data',
+    disclaimed.confidence >= nothing.confidence, `${disclaimed.confidence} vs ${nothing.confidence}`);
+
+  // A 1970 timestamp is garbage, not "the oldest date".
+  const epochMerge = mergeTelemetry(T('a', { lastSuccessAt: 0 }), T('b', { lastSuccessAt: ago(1) }));
+  const epochScore = score({ code: 'T', telemetry: epochMerge });
+  check('merge: epoch-0 timestamp does not mask a real one', epochScore.lastWorkedAt === ago(1),
+    String(epochScore.lastWorkedAt));
+
+  check('merge: keeps the most recent success',
+    mergeTelemetry(T('a', { lastSuccessAt: ago(5) }), T('b', { lastSuccessAt: ago(1) })).bySource.b.lastSuccessAt === ago(1));
+  check('merge: tracks distinct sources',
+    score({ code: 'U', telemetry: mergeTelemetry(T('a', {}), T('b', {})) }).sourceCount === 2);
 }
 
 // ---- HTTP API (needs dev server running) ----

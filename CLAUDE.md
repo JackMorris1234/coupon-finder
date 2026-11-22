@@ -55,13 +55,18 @@ Instead, confidence is scored from **the sources' own redemption telemetry** —
 | Savings.com | "Used 210 Times" (`countFrom`) — volume only, no success breakdown |
 | PromoCodes.com | `isVerified`, `validatedDate`, `copyCountToday` |
 
-Scoring: telemetry is **pooled across every source reporting the same code** during dedup in `scrapers/index.js`, then `scoreOffer()` computes a **Wilson score lower bound** on successes/attempts (so 1-of-1 can't outrank 271-of-465), scaled against `STRONG_RATE` 0.5, multiplied by a recency factor and plus up to +18 for cross-source corroboration → `confidence` 0–99 and a `band`.
+Telemetry is kept **per source** (`telemetry.bySource`, keyed by source name) and merged in `scrapers/index.js` during dedup. `scoreOffer()` builds a prior from the non-count signals (works-score → verified badge → usage volume → `NO_EVIDENCE_BASE`), then regresses the **Wilson score lower bound** of the best single sample toward that prior, applies a recency factor and a small corroboration bonus → `confidence` 0–99 and a `band`.
 
-Bands: `high` (≥70) "✓ Works", `likely` (≥45) "✓ Likely works", `poor` (<20) "⚠ Rarely works", else `unknown` "? Unconfirmed". `status` is derived for back-compat.
+Bands: `high` (≥70) "✓ Works", `likely` (≥45) "✓ Likely works", `poor` "⚠ Rarely works", else `unknown` "? Unconfirmed". `status` is derived for back-compat.
 
-**Two honesty rules that must not be weakened:**
-1. An offer is labelled `poor` **only** when `attempts >= 20` AND it has a code. Absence of evidence is never presented as evidence of failure.
-2. Samples below 20 regress toward `NO_EVIDENCE_BASE` (0.3) and their evidence string reads "only N redemptions recorded — too few to judge" rather than a damning ratio we aren't willing to stand behind.
+**Four rules that must not be weakened** — each one is a bug adversarial review already caught here:
+
+1. **Never sum counts across sources.** Measured 2026-11-21: CouponFollow and DealHack republish *byte-identical* counts for the same codes (APP15 = 389 attempts / 1 success on both; CBFY27DKVKNKXGWD = 92/3 on both). They are not independent observers, so summing doubles one dataset and invents a sample — it was manufacturing the 20-attempt threshold that unlocks "Rarely works". `scoreOffer` uses the single best-evidenced source; merging two records from the *same* source takes the max, never the sum. Corroboration is a separate, capped signal, and the UI says "listed by N sources", not "N sources agree".
+2. **More evidence must never lower a score.** Observed rates regress toward the prior built from the other signals — not toward a fixed floor. (The old code let a 2-of-2 success report drop a strong offer from 83/high to 40/unknown.)
+3. **"Rarely works" is a claim about failure**, never about staleness or missing data: it needs `attempts >= 20`, a low *rate*, and a code. Age can only move an offer to `unknown`, never to `poor`. Adapters must not fabricate a 0-of-N sample when a success rate is missing (see `usageTelemetry` in dealdrop.js — report `uses` instead).
+4. **Badge and evidence sentence must never contradict.** No "✓ Works" beside "too few to judge"; no "last worked" unless a success was actually recorded (otherwise "last seen"); the tooltip describes the evidence the card actually has.
+
+Inputs are sanitized at the door: successes clamped to attempts, negatives/NaN rejected, `sourceConfidence: 0` treated as the source disclaiming its own score, timestamp `0` treated as garbage rather than 1970.
 
 The counts are self-reported by the coupon sites, so treat them as relative signal — the UI tooltip says so. Expired codes are dropped in the adapter. "⟳ Refresh & re-check" forces a re-scrape (`refresh=1`); note `evidence`/`confidence` are stored derived values, so changing the model requires a re-scrape to take effect on existing rows.
 

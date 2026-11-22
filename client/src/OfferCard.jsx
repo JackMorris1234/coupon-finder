@@ -10,18 +10,24 @@ const BANDS = {
   poor: { label: '⚠ Rarely works', className: 'badge-poor' },
 };
 
-const EVIDENCE_HINT =
-  "Pooled from the coupon sites' own redemption telemetry (how many shoppers tried the code and how many succeeded). Self-reported by those sites, so treat it as relative signal rather than a guarantee.";
+// The tooltip must describe the evidence this card actually has — many offers
+// carry no redemption counts at all.
+const hintFor = (offer) => (offer.attempts > 0
+  ? `Scored from ${offer.source}'s own record of ${offer.attempts} redemption attempt${offer.attempts === 1 ? '' : 's'} and how many succeeded. Self-reported by that site, so treat it as relative signal rather than a guarantee.`
+  : 'No redemption counts are published for this offer — the score reflects the listing signals the sources do give (verified badges, recency of use). Self-reported, so treat it as relative signal rather than a guarantee.');
 
 export default function OfferCard({ offer, bestPick = false }) {
   const band = BANDS[offer.band] ?? (offer.status === 'verified' ? BANDS.likely : BANDS.unknown);
   // Only claim it "worked" when a source actually recorded a success; a bare
   // activity timestamp means someone used it, not that it applied.
   const workedLabel = offer.successes > 0 ? 'last worked' : 'last seen';
+  const hint = hintFor(offer);
   const detail = [
     offer.evidence,
     offer.lastWorkedAt ? `${workedLabel} ${timeAgo(offer.lastWorkedAt)}` : null,
-    offer.sourceCount > 1 ? `${offer.sourceCount} sources agree` : null,
+    // Sources republish each other's numbers, so this counts listings, not
+    // independent confirmations.
+    offer.sourceCount > 1 ? `listed by ${offer.sourceCount} sources` : null,
   ].filter(Boolean).join(' · ');
 
   return (
@@ -31,14 +37,14 @@ export default function OfferCard({ offer, bestPick = false }) {
         {offer.discountText && <span className="discount">{offer.discountText}</span>}
         <span
           className={`badge ${band.className}`}
-          title={offer.confidence != null ? `Confidence ${offer.confidence}/100 — ${EVIDENCE_HINT}` : EVIDENCE_HINT}
+          title={offer.confidence != null ? `Confidence ${offer.confidence}/100 — ${hint}` : hint}
         >
           {band.label}
         </span>
       </div>
       <h4>{offer.title}</h4>
       {offer.description && <p className="desc">{offer.description}</p>}
-      {detail && <p className="evidence" title={EVIDENCE_HINT}>{detail}</p>}
+      {detail && <p className="evidence" title={hint}>{detail}</p>}
       <div className="card-bottom">
         {offer.code ? (
           <CopyCode code={offer.code} />

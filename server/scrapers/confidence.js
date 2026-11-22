@@ -2,24 +2,34 @@
 //
 // The coupon sites watch what happens when real shoppers redeem a code —
 // attempt/success counts, "last worked" timestamps, their own works-scores.
-// Pooling that across every source reporting a given code gives a far better
-// answer than the binary verified/unconfirmed flag it replaces, which ignored
-// all of it (it called a code "Verified" that had succeeded 4 times in 49).
+// Scoring that beats the binary verified/unconfirmed flag it replaces, which
+// called a code "Verified" that had succeeded 4 times in 49.
 //
-// Honesty notes baked into the model:
-//  - The counts are self-reported by sites with an incentive to look useful,
-//    so treat them as relative signal, not ground truth.
-//  - Absence of data is NOT evidence of failure: an offer is only ever called
-//    "rarely works" when there is a real sample behind the doubt.
+// Hard-won design rules (each one is a bug this module already had):
+//  1. NEVER sum counts across sources. Measured 2026-11-21: CouponFollow and
+//     DealHack republish identical numbers for the same codes (APP15 = 389
+//     attempts / 1 success on both), so summing doubles a single dataset and
+//     invents a sample. We use the single best-evidenced source and treat
+//     agreement as a separate, modest signal.
+//  2. More evidence must never lower a score. Observed rates regress toward
+//     the prior built from the other signals, not toward a fixed floor.
+//  3. "Rarely works" is a claim about FAILURE, never about staleness or
+//     missing data, and it needs a real sample behind it.
+//  4. The badge and the evidence sentence beside it must never contradict.
+//
+// The counts are self-reported by sites with an incentive to look useful, so
+// they are relative signal, not ground truth.
 
-const Z = 1.96;               // 95% Wilson interval
-const STRONG_RATE = 0.5;      // a code working for half of real attempts is as good as coupons get
-const MIN_SAMPLE_FOR_DOUBT = 20; // below this we never call a code bad
-const NO_EVIDENCE_BASE = 0.3;    // the "we simply don't know" baseline
+const Z = 1.96;                   // 95% Wilson interval
+const STRONG_RATE = 0.5;          // a code working for half of real attempts is as good as coupons get
+const MIN_SAMPLE_FOR_DOUBT = 20;  // below this we never call a code bad
+const NO_EVIDENCE_BASE = 0.3;     // the "we simply don't know" baseline
+const WEAK_RATE = 0.2;            // scaled rate below this, with a sample, means it fails
+const STALE_DAYS = 120;           // older than this we decline to affirm anything
 const DAY = 24 * 60 * 60 * 1000;
 
-// Wilson score lower bound — the standard way to rank by success rate without
-// letting 1-of-1 (100%) outrank 271-of-465 (58%).
+// Wilson score lower bound — ranks by success rate without letting 1-of-1
+// (100%) outrank 271-of-465 (58%).
 export function wilsonLowerBound(successes, attempts) {
   if (!attempts || attempts <= 0) return null;
   const p = Math.min(1, Math.max(0, successes / attempts));
@@ -30,111 +40,166 @@ export function wilsonLowerBound(successes, attempts) {
   return Math.max(0, (center - margin) / denominator);
 }
 
-export const emptyTelemetry = () => ({
-  attempts: 0,            // redemption/verification attempts observed by a source
-  successes: 0,           // of those, how many worked
-  uses: 0,                // usage count with no success breakdown (weaker signal)
-  lastSuccessAt: null,    // when it last demonstrably worked (ms)
-  lastVerifiedAt: null,   // when a source last declared it verified (ms)
-  sourceScore: null,      // a source's own 0-100 works-score, if published
-  sourceConfidence: null, // 0-1 confidence in that score
-  declaredVerified: false,
-  sources: [],
-});
+const finite = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+const count = (v) => {
+  const n = finite(v);
+  return n == null || n < 0 ? 0 : Math.floor(n);
+};
+// A timestamp of 0 means a 1970 date, i.e. garbage — not "the epoch".
+const stamp = (v) => {
+  const n = finite(v);
+  return n != null && n > 0 ? n : null;
+};
+const laterOf = (a, b) => (a != null && b != null ? Math.max(a, b) : a ?? b ?? null);
 
-// Pool evidence from every source reporting the same code. Different sites
-// count slightly different things (verification attempts vs shopper uses), so
-// this is approximate — but discarding it entirely was worse.
-export function mergeTelemetry(a, b) {
-  if (!a) return b ? { ...emptyTelemetry(), ...b } : emptyTelemetry();
-  if (!b) return a;
-  const maxTs = (x, y) => (x && y ? Math.max(x, y) : x ?? y ?? null);
-  const pickScore = () => {
-    // keep the score backed by the higher confidence
-    const ac = a.sourceConfidence ?? 0;
-    const bc = b.sourceConfidence ?? 0;
-    if (a.sourceScore == null) return { sourceScore: b.sourceScore, sourceConfidence: b.sourceConfidence };
-    if (b.sourceScore == null) return { sourceScore: a.sourceScore, sourceConfidence: a.sourceConfidence };
-    return bc > ac
-      ? { sourceScore: b.sourceScore, sourceConfidence: b.sourceConfidence }
-      : { sourceScore: a.sourceScore, sourceConfidence: a.sourceConfidence };
-  };
+// One source's view of one offer, with impossible values rejected at the door.
+function sanitize(raw = {}) {
+  const attempts = count(raw.attempts);
+  const sourceConfidence = finite(raw.sourceConfidence);
+  const rawScore = finite(raw.sourceScore);
+  // sourceConfidence === 0 means the source disclaims its own score.
+  const usableScore =
+    rawScore != null && rawScore >= 0 && (sourceConfidence == null || sourceConfidence > 0);
   return {
-    attempts: (a.attempts ?? 0) + (b.attempts ?? 0),
-    successes: (a.successes ?? 0) + (b.successes ?? 0),
-    uses: (a.uses ?? 0) + (b.uses ?? 0),
-    lastSuccessAt: maxTs(a.lastSuccessAt, b.lastSuccessAt),
-    lastVerifiedAt: maxTs(a.lastVerifiedAt, b.lastVerifiedAt),
-    ...pickScore(),
-    declaredVerified: Boolean(a.declaredVerified || b.declaredVerified),
-    sources: [...new Set([...(a.sources ?? []), ...(b.sources ?? [])])],
+    attempts,
+    successes: Math.min(count(raw.successes), attempts), // successes can never exceed attempts
+    uses: count(raw.uses),
+    lastSuccessAt: stamp(raw.lastSuccessAt),
+    lastVerifiedAt: stamp(raw.lastVerifiedAt),
+    sourceScore: usableScore ? rawScore : null,
+    sourceConfidence: sourceConfidence != null && sourceConfidence > 0 ? Math.min(1, sourceConfidence) : null,
+    declaredVerified: Boolean(raw.declaredVerified),
   };
+}
+
+export const emptyTelemetry = () => ({ bySource: {} });
+
+// Wrap one adapter's flat telemetry as a per-source record.
+export function telemetryFor(sourceName, raw) {
+  return { bySource: { [sourceName || 'unknown']: sanitize(raw) } };
+}
+
+// Combine two records from the SAME source (a site listing one code twice):
+// take the better-evidenced view rather than adding them together.
+function mergeSameSource(a, b) {
+  const attempts = Math.max(a.attempts, b.attempts);
+  const preferB = (b.sourceConfidence ?? 0.6) > (a.sourceConfidence ?? 0.6);
+  const scored = b.sourceScore != null && (a.sourceScore == null || preferB) ? b : a;
+  return {
+    attempts,
+    successes: Math.min(Math.max(a.successes, b.successes), attempts),
+    uses: Math.max(a.uses, b.uses),
+    lastSuccessAt: laterOf(a.lastSuccessAt, b.lastSuccessAt),
+    lastVerifiedAt: laterOf(a.lastVerifiedAt, b.lastVerifiedAt),
+    sourceScore: scored.sourceScore,
+    sourceConfidence: scored.sourceConfidence,
+    declaredVerified: a.declaredVerified || b.declaredVerified,
+  };
+}
+
+export function mergeTelemetry(a, b) {
+  const left = a?.bySource ?? {};
+  const right = b?.bySource ?? {};
+  const bySource = { ...left };
+  for (const [name, record] of Object.entries(right)) {
+    bySource[name] = bySource[name] ? mergeSameSource(bySource[name], record) : record;
+  }
+  return { bySource };
 }
 
 function recencyFactor(ts, nowMs) {
-  if (!ts) return 0.35;            // unknown age — neither trusted nor condemned
+  if (!ts) return 0.8; // unknown age is a mild discount, never a verdict
   const days = (nowMs - ts) / DAY;
   if (days <= 2) return 1;
-  if (days <= 7) return 0.95;
-  if (days <= 30) return 0.8;
-  if (days <= 60) return 0.6;
-  if (days <= 90) return 0.45;
-  return 0.3;
+  if (days <= 7) return 0.97;
+  if (days <= 30) return 0.9;
+  if (days <= 60) return 0.8;
+  if (days <= 90) return 0.7;
+  return 0.55;
 }
 
-// -> { confidence 0-99, band, evidence, lastWorkedAt, sourceCount }
+// -> { confidence 0-99, band, evidence, lastWorkedAt, sourceCount, attempts, successes }
 export function scoreOffer(offer, nowMs = Date.now()) {
-  const t = { ...emptyTelemetry(), ...(offer.telemetry ?? {}) };
-  const lastGood = Math.max(t.lastSuccessAt ?? 0, t.lastVerifiedAt ?? 0) || null;
-  const recency = recencyFactor(lastGood, nowMs);
-  const sourceCount = Math.max(t.sources?.length ?? 0, 1);
-  const corroboration = Math.min(18, (sourceCount - 1) * 6);
+  const bySource = offer.telemetry?.bySource ?? {};
+  const names = Object.keys(bySource);
+  const records = names.length ? Object.values(bySource) : [sanitize({})];
 
-  let base;
-  let evidence;
-  if (t.attempts >= 1) {
-    let estimate = Math.min(1, wilsonLowerBound(t.successes, t.attempts) / STRONG_RATE);
-    // Small samples regress toward the no-evidence baseline: a handful of
-    // failures must not condemn a code, and a lucky 1-of-1 must not crown it.
-    if (t.attempts < MIN_SAMPLE_FOR_DOUBT) {
-      const weight = t.attempts / MIN_SAMPLE_FOR_DOUBT;
-      estimate = estimate * weight + NO_EVIDENCE_BASE * (1 - weight);
-    }
-    base = estimate;
-    if (t.attempts < MIN_SAMPLE_FOR_DOUBT) {
-      // Don't let a damning-sounding ratio stand in for a verdict we are
-      // explicitly declining to reach on this little evidence.
-      evidence = `only ${t.attempts} redemption${t.attempts === 1 ? '' : 's'} recorded — too few to judge`;
-    } else {
-      const pct = Math.round((t.successes / t.attempts) * 100);
-      evidence = `worked for ${pct}% of ${t.attempts} redemptions`;
-    }
-  } else if (t.sourceScore != null) {
-    const conf = t.sourceConfidence == null ? 0.6 : Math.min(1, Math.max(0, t.sourceConfidence));
-    base = (t.sourceScore / 100) * conf;
-    evidence = `source works-score ${Math.round(t.sourceScore)}/100`;
-  } else if (t.declaredVerified) {
-    base = 0.55;
+  // Rule 1: pick the best-evidenced single source; never add samples together.
+  const best = records.reduce((a, b) => (b.attempts > a.attempts ? b : a), records[0]);
+  const scored = records
+    .filter((r) => r.sourceScore != null)
+    .sort((a, b) => (b.sourceConfidence ?? 0.6) - (a.sourceConfidence ?? 0.6))[0] ?? null;
+  const anyVerified = records.some((r) => r.declaredVerified);
+  const maxUses = records.reduce((acc, r) => Math.max(acc, r.uses), 0);
+  const lastGood = records.reduce(
+    (acc, r) => laterOf(acc, laterOf(r.lastSuccessAt, r.lastVerifiedAt)),
+    null
+  );
+
+  // The prior: what the non-count signals say on their own.
+  let prior = NO_EVIDENCE_BASE;
+  let evidence = 'no redemption data';
+  if (scored) {
+    prior = Math.min(1, (scored.sourceScore / 100) * (scored.sourceConfidence ?? 0.6));
+    evidence = `source works-score ${Math.round(scored.sourceScore)}/100`;
+  } else if (anyVerified) {
+    prior = 0.55;
     evidence = 'listed as verified by the source';
-  } else if (t.uses > 0) {
-    base = 0.35;
-    evidence = `used ${t.uses} times (no success breakdown)`;
-  } else {
-    base = NO_EVIDENCE_BASE;
-    evidence = 'no redemption data';
+  } else if (maxUses > 0) {
+    prior = 0.35;
+    evidence = `used ${maxUses} times (no success breakdown)`;
   }
 
-  const confidence = Math.max(0, Math.min(99, Math.round(base * 100 * recency + corroboration)));
+  // Rule 2: observed rates regress toward that prior, so adding evidence can
+  // refine the estimate but never collapse it.
+  let base = prior;
+  if (best.attempts >= 1) {
+    const observed = Math.min(1, wilsonLowerBound(best.successes, best.attempts) / STRONG_RATE);
+    const weight = Math.min(1, best.attempts / MIN_SAMPLE_FOR_DOUBT);
+    base = observed * weight + prior * (1 - weight);
+    const pct = Math.round((best.successes / best.attempts) * 100);
+    // Rule 4: state the fact and flag the limitation — never print a verdict
+    // the badge contradicts.
+    evidence = best.attempts < MIN_SAMPLE_FOR_DOUBT
+      ? `worked for ${pct}% of ${best.attempts} redemption${best.attempts === 1 ? '' : 's'} (small sample)`
+      : `worked for ${pct}% of ${best.attempts} redemptions`;
+  }
 
-  // A real sample is required before we are willing to call a code bad.
-  const hasSample = t.attempts >= MIN_SAMPLE_FOR_DOUBT;
+  const sourceCount = Math.max(names.length, 1);
+  const corroboration = Math.min(10, (sourceCount - 1) * 4);
+  const raw = base * 100 * recencyFactor(lastGood, nowMs) + corroboration;
+  const confidence = Number.isFinite(raw) ? Math.max(0, Math.min(99, Math.round(raw))) : 0;
+
+  const hasSample = best.attempts >= MIN_SAMPLE_FOR_DOUBT;
+  const scaledRate = best.attempts >= 1
+    ? wilsonLowerBound(best.successes, best.attempts) / STRONG_RATE
+    : null;
+  const observedRate = best.attempts >= 1 ? best.successes / best.attempts : null;
+  const stale = lastGood != null && (nowMs - lastGood) / DAY > STALE_DAYS;
+
   let band;
-  if (confidence >= 70) band = 'high';
-  else if (confidence >= 45) band = 'likely';
-  else if (confidence < 20 && hasSample && offer.code) band = 'poor';
-  else band = 'unknown';
+  if (hasSample && scaledRate < WEAK_RATE && offer.code) {
+    band = 'poor';                                   // rule 3: a failure claim, from a real sample
+  } else if (stale || (observedRate != null && observedRate < WEAK_RATE)) {
+    band = 'unknown';                                // too old, or only ever seen to fail
+  } else if (confidence >= 70 && (hasSample || scored)) {
+    band = 'high';
+  } else if (confidence >= 45 && (hasSample || scored || anyVerified)) {
+    band = 'likely';
+  } else {
+    band = 'unknown';
+  }
 
-  return { confidence, band, evidence, lastWorkedAt: lastGood, sourceCount };
+  return {
+    confidence,
+    band,
+    evidence,
+    lastWorkedAt: lastGood,
+    sourceCount,
+    attempts: best.attempts,
+    successes: best.successes,
+    hasSuccessData: best.attempts >= 1 || scored != null,
+  };
 }
 
 // Back-compat: the rest of the app still speaks verified/unconfirmed.

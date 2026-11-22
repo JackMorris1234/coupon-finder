@@ -45,20 +45,29 @@ export async function scrape(domain, slug) {
         sourceUrl: pageUrl,
         sourceVerified: o.verification_status === 'verified',
         verifiedAt: toTs(o.last_verified_at),
-        // success_rate is a percentage of usage_count (e.g. 8.17% of 49).
-        telemetry: {
-          attempts: Number(o.usage_count) || 0,
-          successes: Number(o.usage_count) && Number(o.success_rate)
-            ? Math.round((Number(o.usage_count) * Number(o.success_rate)) / 100)
-            : 0,
+        // success_rate is a PERCENTAGE of usage_count (e.g. 8.17% of 49).
+        // Only report attempts when the rate is actually usable — otherwise a
+        // missing rate would fabricate a 0-of-N sample and condemn the code.
+        telemetry: usageTelemetry(o.usage_count, o.success_rate, {
           lastVerifiedAt: toTs(o.last_verified_at),
           declaredVerified: o.verification_status === 'verified',
-          sources: [name],
-        },
+        }),
       });
     }
   }
   return offers;
+}
+
+// A usable sample needs BOTH a usage count and a numeric success rate. With a
+// count but no rate we report volume only (uses), never a 0% success sample.
+function usageTelemetry(usageCount, successRate, rest) {
+  const uses = Number(usageCount);
+  const rate = Number(successRate);
+  if (!Number.isFinite(uses) || uses <= 0) return { ...rest };
+  if (!Number.isFinite(rate) || successRate == null || successRate === '') {
+    return { ...rest, uses };
+  }
+  return { ...rest, attempts: uses, successes: Math.round((uses * rate) / 100) };
 }
 
 function formatDiscount(type, value, title = '') {
