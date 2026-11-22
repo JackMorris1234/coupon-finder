@@ -48,6 +48,13 @@ export async function scrape(domain, slug) {
       sourceVerified: Boolean(o.isVerified),
       verifiedAt: toTs(o.validatedDate),
       expiresAt,
+      telemetry: {
+        uses: Number(o.copyCountToday) || 0,
+        lastVerifiedAt: toTs(o.validatedDate),
+        lastSuccessAt: toTs(o.latestTransactionDate),
+        declaredVerified: Boolean(o.isVerified),
+        sources: [name],
+      },
     });
   }
   return offers;

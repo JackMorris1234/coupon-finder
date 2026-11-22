@@ -63,6 +63,16 @@ export async function scrape(domain) {
         if (data.isVerified) offer.sourceVerified = true;
         offer.verifiedAt = toTs(data.lastVerifiedOn) ?? offer.verifiedAt;
         offer.expiresAt = toTs(data.expiresOn) ?? offer.expiresAt;
+        // The same modal response carries community verification counts —
+        // free telemetry on an endpoint we already call.
+        offer.telemetry = {
+          attempts: Number(data.verificationCount) || 0,
+          successes: Number(data.verificationSuccessCount) || 0,
+          lastSuccessAt: toTs(data.lastSuccessDate),
+          lastVerifiedAt: toTs(data.lastVerifiedOn),
+          declaredVerified: Boolean(data.isVerified),
+          sources: [name],
+        };
       }
     } catch { /* leave as click-to-reveal */ }
     await sleep(REVEAL_DELAY_MS);

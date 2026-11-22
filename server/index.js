@@ -59,14 +59,15 @@ app.get('/api/search', async (req, res) => {
   });
 });
 
-// Within each group (codes / deals / hidden) rank verified first, then by
-// discount size, then freshness — so the best usable code leads the page.
+// Within each group (codes / deals / hidden) rank by confidence — the pooled
+// redemption evidence from scrapers/confidence.js — then discount size, then
+// freshness. Codes that demonstrably fail sink to the bottom of their group.
 function rankOffers(offers) {
   const groupOf = (o) => (o.code ? 0 : o.kind === 'hidden' ? 2 : 1);
   const value = (o) => Number(o.discountText?.match(/\d+(\.\d+)?/)?.[0] ?? 0);
   return offers.slice().sort((a, b) =>
     groupOf(a) - groupOf(b) ||
-    (b.status === 'verified') - (a.status === 'verified') ||
+    (b.confidence ?? 0) - (a.confidence ?? 0) ||
     value(b) - value(a) ||
     b.lastSeenAt - a.lastSeenAt
   );

@@ -2,6 +2,7 @@
 // --fast skips the live scrape-pipeline tests (used between small refactors);
 // a full run exercises every feature against live sources + the running API.
 import { groupSuggestions } from './resolve.js';
+import { scoreOffer, emptyTelemetry, wilsonLowerBound, mergeTelemetry } from './scrapers/confidence.js';
 
 const FAST = process.argv.includes('--fast');
 const API = 'http://localhost:3001';
@@ -62,6 +63,50 @@ function check(name, ok, detail = '') {
   check('group: members carried for UI', nike.length === 1 && nike[0].members[0].domain === 'nike.sk');
 }
 
+// ---- confidence scoring (pure) ----
+{
+  const now = Date.now();
+  const ago = (days) => now - days * 24 * 60 * 60 * 1000;
+  const T = (o) => ({ ...emptyTelemetry(), ...o });
+  const score = (offer) => scoreOffer(offer, now);
+
+  check('wilson: large sample beats lucky small one',
+    wilsonLowerBound(271, 465) > wilsonLowerBound(1, 1));
+  check('wilson: null on zero attempts', wilsonLowerBound(0, 0) === null);
+
+  const strong = score({ code: 'A', telemetry: T({ attempts: 465, successes: 271, lastSuccessAt: ago(0.2), sources: ['x', 'y', 'z'] }) });
+  check('score: strong recent code is high band', strong.band === 'high' && strong.confidence >= 70,
+    `${strong.confidence}/${strong.band}`);
+
+  const dead = score({ code: 'B', telemetry: T({ attempts: 360, successes: 1, lastSuccessAt: ago(3), sources: ['x'] }) });
+  check('score: 1-of-360 is poor band', dead.band === 'poor' && dead.confidence < 20,
+    `${dead.confidence}/${dead.band}`);
+
+  // The central honesty guard: never call a code bad without a real sample.
+  const thin = score({ code: 'C', telemetry: T({ attempts: 5, successes: 0, lastVerifiedAt: ago(5), sources: ['x'] }) });
+  check('score: small bad sample is never labelled poor', thin.band === 'unknown',
+    `${thin.confidence}/${thin.band}`);
+
+  const lucky = score({ code: 'D', telemetry: T({ attempts: 1, successes: 1, lastSuccessAt: ago(1), sources: ['x'] }) });
+  check('score: lucky 1-of-1 is not crowned high', lucky.band !== 'high', `${lucky.confidence}/${lucky.band}`);
+
+  const blank = score({ code: 'E', telemetry: T({ sources: ['x'] }) });
+  check('score: no telemetry stays unknown, not poor', blank.band === 'unknown', blank.band);
+  check('score: no telemetry outranks a demonstrably dead code', blank.confidence > dead.confidence);
+
+  const deal = score({ code: null, telemetry: T({ attempts: 100, successes: 0, sources: ['x'] }) });
+  check('score: code-less deals are never labelled poor', deal.band !== 'poor', deal.band);
+
+  const pooled = mergeTelemetry(
+    T({ attempts: 465, successes: 271, lastSuccessAt: ago(5), sources: ['DealHack'] }),
+    T({ attempts: 360, successes: 1, lastSuccessAt: ago(1), sources: ['CouponFollow'] })
+  );
+  check('merge: pools counts across sources', pooled.attempts === 825 && pooled.successes === 272,
+    `${pooled.successes}/${pooled.attempts}`);
+  check('merge: keeps the most recent success', pooled.lastSuccessAt === ago(1));
+  check('merge: unions source names', pooled.sources.length === 2);
+}
+
 // ---- HTTP API (needs dev server running) ----
 try {
   const suggest = await fetch(`${API}/api/suggest?q=nike`).then((r) => r.json());
@@ -73,6 +118,13 @@ try {
   const search = await fetch(`${API}/api/search?domain=nike.com&name=Nike`).then((r) => r.json());
   check('api: search returns offers', Array.isArray(search.offers) && search.offers.length > 10, `got ${search.offers?.length}`);
   check('api: offers have kind + status', search.offers.every((o) => o.kind && o.status));
+  check('api: offers carry confidence + band + evidence',
+    search.offers.every((o) => typeof o.confidence === 'number' && o.band && o.evidence));
+  const apiCodes = search.offers.filter((o) => o.code);
+  check('api: codes ranked by confidence desc',
+    apiCodes.every((o, i) => i === 0 || apiCodes[i - 1].confidence >= o.confidence));
+  check('api: no offer labelled poor without a real sample',
+    search.offers.every((o) => o.band !== 'poor' || (o.attempts >= 20 && o.code)));
   check('api: codes are real codes', search.offers.filter((o) => o.code).every((o) => /^[A-Z0-9]/.test(o.code)));
 
   const hist = await fetch(`${API}/api/history`).then((r) => r.json());

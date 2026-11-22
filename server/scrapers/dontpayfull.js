@@ -1,6 +1,6 @@
 import { load } from 'cheerio';
 import { fetchPage } from './fetchPage.js';
-import { toTs } from './util.js';
+import { parseAgo, toTs } from './util.js';
 
 // dontpayfull.com/at/<domain>: active cards mask codes as ***SUFFIX (last 5
 // chars), but the page's own activity timeline leaks the FULL codes
@@ -34,11 +34,15 @@ export async function scrape(domain) {
     const off = card.find('.off__label').first().text().trim();
     const expiresAt = toTs(card.find('.oexpire span').first().text().trim());
     if (expiresAt && expiresAt < nowMs) return;
+    // "Verified 2h ago by our staff" / "Used 8h ago" — relative, parsed to ms.
+    const cardText = card.text();
     cards.push({
       title,
       suffix: mask.startsWith('***') ? mask.slice(3) : null,
       discountText: pct ? `${pct} ${off}`.trim().toLowerCase() : null,
       verified: (card.attr('data-filter') || '').includes('verified'),
+      verifiedAgoAt: parseAgo(cardText.match(/Verified\s+\d+\s*\w+\s*ago/i)?.[0]),
+      usedAgoAt: parseAgo(cardText.match(/Used\s+\d+\s*\w+\s*ago/i)?.[0]),
       expiresAt,
       code: null,
     });
@@ -80,8 +84,14 @@ export async function scrape(domain) {
     source: name,
     sourceUrl: url,
     sourceVerified: c.verified,
-    verifiedAt: c.postedAt ?? null,
+    verifiedAt: c.postedAt ?? c.verifiedAgoAt ?? null,
     expiresAt: c.expiresAt,
+    telemetry: {
+      lastSuccessAt: c.usedAgoAt ?? null,
+      lastVerifiedAt: c.verifiedAgoAt ?? c.postedAt ?? null,
+      declaredVerified: c.verified,
+      sources: [name],
+    },
   }));
 
   for (const t of timeline) {
@@ -97,6 +107,7 @@ export async function scrape(domain) {
       sourceVerified: false,
       verifiedAt: t.postedAt,
       expiresAt: t.expiresAt,
+      telemetry: { lastSuccessAt: t.postedAt, sources: [name] },
     });
   }
   return offers;

@@ -44,11 +44,23 @@ db.exec(`
   );
 `);
 
-// Migration: offers.kind ('code' | 'deal' | 'hidden') — hidden means the
-// source has a code but only reveals it on their site.
-if (!db.prepare(`SELECT 1 FROM pragma_table_info('offers') WHERE name = 'kind'`).get()) {
-  db.exec(`ALTER TABLE offers ADD COLUMN kind TEXT NOT NULL DEFAULT 'deal'`);
-}
+// Additive migrations (SQLite has no ADD COLUMN IF NOT EXISTS).
+const ensureColumn = (table, column, ddl) => {
+  if (!db.prepare('SELECT 1 FROM pragma_table_info(?) WHERE name = ?').get(table, column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+  }
+};
+// kind ('code' | 'deal' | 'hidden') — hidden means the source has a code but
+// only reveals it on their own site.
+ensureColumn('offers', 'kind', `kind TEXT NOT NULL DEFAULT 'deal'`);
+// Confidence scoring (see scrapers/confidence.js): pooled redemption telemetry.
+ensureColumn('offers', 'confidence', 'confidence INTEGER NOT NULL DEFAULT 0');
+ensureColumn('offers', 'band', `band TEXT NOT NULL DEFAULT 'unknown'`);
+ensureColumn('offers', 'evidence', 'evidence TEXT');
+ensureColumn('offers', 'last_worked_at', 'last_worked_at INTEGER');
+ensureColumn('offers', 'source_count', 'source_count INTEGER NOT NULL DEFAULT 1');
+ensureColumn('offers', 'attempts', 'attempts INTEGER NOT NULL DEFAULT 0');
+ensureColumn('offers', 'successes', 'successes INTEGER NOT NULL DEFAULT 0');
 
 const now = () => Date.now();
 
@@ -70,9 +82,11 @@ export function markFetched(domain) {
 
 const upsertOfferStmt = db.prepare(`
   INSERT INTO offers (domain, dedupe_key, code, title, description, discount_text, source, source_url,
-                      status, verified_at, expires_at, kind, first_seen_at, last_seen_at)
+                      status, verified_at, expires_at, kind, confidence, band, evidence,
+                      last_worked_at, source_count, attempts, successes, first_seen_at, last_seen_at)
   VALUES (@domain, @dedupeKey, @code, @title, @description, @discountText, @source, @sourceUrl,
-          @status, @verifiedAt, @expiresAt, @kind, @now, @now)
+          @status, @verifiedAt, @expiresAt, @kind, @confidence, @band, @evidence,
+          @lastWorkedAt, @sourceCount, @attempts, @successes, @now, @now)
   ON CONFLICT(domain, dedupe_key) DO UPDATE SET
     title = excluded.title,
     kind = excluded.kind,
@@ -82,6 +96,13 @@ const upsertOfferStmt = db.prepare(`
     status = excluded.status,
     verified_at = COALESCE(excluded.verified_at, offers.verified_at),
     expires_at = COALESCE(excluded.expires_at, offers.expires_at),
+    confidence = excluded.confidence,
+    band = excluded.band,
+    evidence = excluded.evidence,
+    last_worked_at = COALESCE(excluded.last_worked_at, offers.last_worked_at),
+    source_count = excluded.source_count,
+    attempts = excluded.attempts,
+    successes = excluded.successes,
     last_seen_at = excluded.last_seen_at
 `);
 
@@ -101,6 +122,13 @@ export const upsertOffers = db.transaction((domain, offers) => {
       verifiedAt: o.verifiedAt ?? null,
       expiresAt: o.expiresAt ?? null,
       kind: o.code ? 'code' : (o.hasHiddenCode ? 'hidden' : 'deal'),
+      confidence: o.confidence ?? 0,
+      band: o.band ?? 'unknown',
+      evidence: o.evidence ?? null,
+      lastWorkedAt: o.lastWorkedAt ?? null,
+      sourceCount: o.sourceCount ?? 1,
+      attempts: o.attempts ?? 0,
+      successes: o.successes ?? 0,
       now: now(),
     });
   }
@@ -110,9 +138,11 @@ export function getOffers(domain) {
   return db.prepare(`
     SELECT id, domain, code, title, description, discount_text AS discountText,
            source, source_url AS sourceUrl, status, verified_at AS verifiedAt,
-           expires_at AS expiresAt, kind, first_seen_at AS firstSeenAt, last_seen_at AS lastSeenAt
+           expires_at AS expiresAt, kind, confidence, band, evidence,
+           last_worked_at AS lastWorkedAt, source_count AS sourceCount,
+           attempts, successes, first_seen_at AS firstSeenAt, last_seen_at AS lastSeenAt
     FROM offers WHERE domain = ?
-    ORDER BY (code IS NULL), (kind = 'hidden'), (status != 'verified'), last_seen_at DESC
+    ORDER BY (code IS NULL), (kind = 'hidden'), confidence DESC, last_seen_at DESC
   `).all(domain);
 }
 

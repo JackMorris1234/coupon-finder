@@ -39,14 +39,36 @@ Local web app: search a company, get its active coupon/discount codes scraped fr
 - **Product deals**: Slickdeals RSS search works; DealNews RSS is gone (404) and Reddit JSON is bot-blocked (403).
 - **Weekly flyers**: Flipp backend `backflipp.wishabi.com/flipp/items/search?locale=en-us&postal_code=<zip>&q=<query>` (what the Flipp app uses) — `items[]` carries name, merchant_name, current_price, valid_from/to, flyer images. `server/flyers.js`, 30-min in-memory cache, `/api/flyers?q=&postal=`. When the query matches no product items, the route falls back to a merchant-name match and returns that store's whole circular — ALL items (`merchant` and `total` set; the UI adds a client-side filter box). `/api/store-flyer` caps at 24 and reports `total`; the Store coupons section links users to the flyers tab for the rest.
 - **Freshop grocers** (local chains Flipp doesn't carry, e.g. Donelan's near Acton MA): their sites run on Freshop (Instacart) with a public JSON API. `FRESHOP_GROCERS` in `server/flyers.js` maps normalized store names to `app_key` (found in the site's HTML, e.g. `app_key=donelans`). Flow: `/1/stores?app_key=` → walk candidate stores (chain-level first) until `/1/circulars?store_id=` has one → `/1/products?circular_id=&store_id=&limit=600` (API caps at 100 items, ignores offset — that's the ceiling). Prices: `offer_sale_price` (sale) vs `unit_price` (regular); images need the `_large` suffix: `images.freshop.ncrcloud.com/<cover_image>_large.png`. Beyond the circular, `/1/offers?app_key=&store_id=&limit=200` lists every active markdown; offers **without** `circular_ids` are unadvertised in-store specials (name/`config.price`/`finish_date` directly on the offer, no product join needed — the `products?ids=` batch param is ignored by the API). These are appended to the grocer's flyer items with `saleStory: 'unadvertised special'`. Add new grocers by finding their app_key the same way.
-## Verification model ("Verified" / "Unconfirmed")
+## Confidence model (`server/scrapers/confidence.js`)
 
-Codes cannot be test-applied at real checkouts (bot protection / needs a cart session; probed 2026-11-21 — Shopify cart endpoints are 404/403/429 on major stores, so a simulated-cart checker is not viable). `assignStatus()` in `server/scrapers/index.js` marks an offer **verified** when a source validated it within 60 days, the source flags it verified, or it's corroborated by 2+ sources; otherwise **unconfirmed**. Expired codes are dropped in the adapter. "⟳ Refresh & re-check" forces a re-scrape (`refresh=1`).
+**Do not add a checkout-testing verifier.** Codes cannot be test-applied at real checkouts: probed 2026-11-21, Shopify cart endpoints are 404/403/429 on major stores and retailer checkouts are bot-walled. Beyond not working, automated code-testing creates real cart sessions and is indistinguishable from coupon brute-forcing (against retailer ToS). Merchant-page corroboration was also probed (2026-11-21, n=5): only 1 of 5 merchants served a readable promotions page and **0 of 5 published any code**; adidas/Petco/Walmart block at the edge (Playwright does not help — the block is fingerprint-based, not render-based), and DoorDash's page would false-verify against i18n string templates.
+
+Instead, confidence is scored from **the sources' own redemption telemetry** — they observe thousands of real shoppers redeeming codes, which beats any single synthetic test:
+
+| Source | Telemetry captured |
+|---|---|
+| DealHack | `shopperUseCount`/`shopperSuccessCount`, `cesWorksScore` + `cesConfidence`, `lastWorkedAt`, `lastCheckedAt` |
+| CouponFollow | `verificationCount`/`verificationSuccessCount`, `lastSuccessDate` — free, same modal endpoint we already call to reveal codes |
+| DealDrop | `usage_count` + `success_rate` (a **percent** of usage_count), `verification_status`, `last_verified_at` |
+| Coupons.com | `voucherStatistic.lastUsedDate` |
+| DontPayFull | "Verified 2h ago" / "Used 8h ago" relative strings (`parseAgo` in util.js) |
+| Savings.com | "Used 210 Times" (`countFrom`) — volume only, no success breakdown |
+| PromoCodes.com | `isVerified`, `validatedDate`, `copyCountToday` |
+
+Scoring: telemetry is **pooled across every source reporting the same code** during dedup in `scrapers/index.js`, then `scoreOffer()` computes a **Wilson score lower bound** on successes/attempts (so 1-of-1 can't outrank 271-of-465), scaled against `STRONG_RATE` 0.5, multiplied by a recency factor and plus up to +18 for cross-source corroboration → `confidence` 0–99 and a `band`.
+
+Bands: `high` (≥70) "✓ Works", `likely` (≥45) "✓ Likely works", `poor` (<20) "⚠ Rarely works", else `unknown` "? Unconfirmed". `status` is derived for back-compat.
+
+**Two honesty rules that must not be weakened:**
+1. An offer is labelled `poor` **only** when `attempts >= 20` AND it has a code. Absence of evidence is never presented as evidence of failure.
+2. Samples below 20 regress toward `NO_EVIDENCE_BASE` (0.3) and their evidence string reads "only N redemptions recorded — too few to judge" rather than a damning ratio we aren't willing to stand behind.
+
+The counts are self-reported by the coupon sites, so treat them as relative signal — the UI tooltip says so. Expired codes are dropped in the adapter. "⟳ Refresh & re-check" forces a re-scrape (`refresh=1`); note `evidence`/`confidence` are stored derived values, so changing the model requires a re-scrape to take effect on existing rows.
 
 ## Data model (SQLite)
 
 - `companies(domain PK, name, logo_url, last_fetched_at)` — `last_fetched_at` drives the 6h cache TTL
-- `offers(domain, dedupe_key UNIQUE per domain, code, title, …, status, verified_at, expires_at, kind, first_seen_at, last_seen_at)` — upsert bumps `last_seen_at` (freshness badge). `kind` ∈ `code`/`deal`/`hidden` (hidden = source has the code but didn't yield it; UI collapses these behind a "click-to-reveal on other sites" expander). After a successful re-scrape, `pruneStaleOffers` deletes rows the sources no longer list — old code-less twins of revealed codes go away with them.
+- `offers(domain, dedupe_key UNIQUE per domain, code, title, …, status, verified_at, expires_at, kind, confidence, band, evidence, last_worked_at, source_count, attempts, successes, first_seen_at, last_seen_at)` — upsert bumps `last_seen_at` (freshness badge). `kind` ∈ `code`/`deal`/`hidden` (hidden = source has the code but didn't yield it; UI collapses these behind a "click-to-reveal on other sites" expander). Columns are added by the `ensureColumn` helper (SQLite lacks ADD COLUMN IF NOT EXISTS). Ordering is `confidence DESC`, matching `rankOffers` in index.js — keep the two in sync. After a successful re-scrape, `pruneStaleOffers` deletes rows the sources no longer list — old code-less twins of revealed codes go away with them.
 - `history`, `favorites` — history display dedupes by company name (most recent domain wins)
 
 ## API

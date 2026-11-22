@@ -10,6 +10,10 @@ export const name = 'DealHack';
 export const usesSlug = true;
 
 const str = (chunk, field) => chunk.match(new RegExp(`${field}:"((?:[^"\\\\]|\\\\.)*)"`))?.[1] ?? null;
+const num = (chunk, field) => {
+  const m = chunk.match(new RegExp(`${field}:(-?\\d+(?:\\.\\d+)?)`));
+  return m ? Number(m[1]) : null;
+};
 
 export async function scrape(domain, slug) {
   const url = `https://dealhack.com/coupons/${slug}`;
@@ -46,6 +50,18 @@ export async function scrape(domain, slug) {
       sourceVerified: /isVerified:!0/.test(scope),
       verifiedAt: toTs(str(scope, 'lastWorkedAt')),
       expiresAt,
+      // Richest telemetry of any source: real shopper redemption counts plus
+      // its own works-score (cesWorksScore) and confidence in that score.
+      telemetry: {
+        attempts: num(scope, 'shopperUseCount') ?? 0,
+        successes: num(scope, 'shopperSuccessCount') ?? 0,
+        lastSuccessAt: toTs(str(scope, 'lastWorkedAt')),
+        lastVerifiedAt: toTs(str(scope, 'lastCheckedAt')),
+        sourceScore: num(scope, 'cesWorksScore'),
+        sourceConfidence: num(scope, 'cesConfidence'),
+        declaredVerified: /isVerified:!0/.test(scope),
+        sources: [name],
+      },
     });
   }
   return offers;

@@ -1,6 +1,6 @@
 import { load } from 'cheerio';
 import { fetchPage } from './fetchPage.js';
-import { discountFrom, toTs } from './util.js';
+import { countFrom, discountFrom, toTs } from './util.js';
 
 // savings.com renders offers server-side as div.module-deal. The on-page code
 // slot is empty, but each code-type offer links a static ~10KB popup page
@@ -75,5 +75,7 @@ export async function scrape(domain, slug) {
     sourceUrl: url,
     sourceVerified: false, // no validation dates; corroboration can still verify
     expiresAt: e.expiresAt,
+    // "Used 210 Times" — volume only, no success breakdown.
+    telemetry: { uses: countFrom(e.usageText) ?? 0, sources: [name] },
   }));
 }

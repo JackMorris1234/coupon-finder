@@ -5,6 +5,7 @@ import * as couponscom from './couponscom.js';
 import * as savingscom from './savingscom.js';
 import * as dontpayfull from './dontpayfull.js';
 import * as dealhack from './dealhack.js';
+import { emptyTelemetry, mergeTelemetry, scoreOffer, statusFromBand } from './confidence.js';
 
 const ADAPTERS = [promocodes, couponfollow, dealdrop, couponscom, savingscom, dontpayfull, dealhack];
 
@@ -35,22 +36,15 @@ async function scrapeWithSlugs(adapter, domain, slugs) {
   return [];
 }
 
-const VERIFIED_MAX_AGE_MS = 60 * 24 * 60 * 60 * 1000; // source validation older than 60 days doesn't count
-
-// Verification policy: we cannot test-apply codes at most retailers' checkouts
-// (bot protection / needs a real cart session), so a code is "verified" when a
-// source recently validated it or it is corroborated by 2+ sources; everything
-// else stays "unconfirmed".
-function assignStatus(offers) {
-  const nowMs = Date.now();
-  for (const o of offers) {
-    const recentlyValidated = o.verifiedAt && nowMs - o.verifiedAt < VERIFIED_MAX_AGE_MS;
-    const sourceVerified = o.sourceVerified && (recentlyValidated || !o.verifiedAt);
-    o.status = sourceVerified || recentlyValidated || o.corroborated ? 'verified' : 'unconfirmed';
-    if (o.status === 'verified' && !o.verifiedAt) o.verifiedAt = nowMs;
-  }
-  return offers;
-}
+// Verification policy: we cannot test-apply codes at retailers' checkouts (bot
+// protection, and automated code-testing is the abuse pattern those defenses
+// exist to stop). Instead we pool the telemetry the sources publish about real
+// shopper redemptions and score it — see confidence.js.
+const withSource = (offer) => {
+  const telemetry = { ...emptyTelemetry(), ...(offer.telemetry ?? {}) };
+  if (!telemetry.sources?.length) telemetry.sources = [offer.source];
+  return telemetry;
+};
 
 export async function scrapeAll(domain, name) {
   const slugs = slugCandidates(domain, name);
@@ -81,21 +75,45 @@ export async function scrapeAll(domain, name) {
     }
   });
 
-  // Dedupe: identical codes across sources collapse (prefer the entry that has
-  // richer verification data); code-less deals dedupe on normalized title.
+  // Dedupe: identical codes across sources collapse into one card, but their
+  // telemetry is POOLED first — what three sources saw about the same code is
+  // strictly better evidence than whichever entry we happened to keep for
+  // display. Code-less deals dedupe on normalized title.
   const byKey = new Map();
-  for (const o of offers) {
-    const key = o.code
-      ? `code:${o.code.toUpperCase()}`
-      : `deal:${o.title.toLowerCase().replace(/[^a-z0-9%$ ]/g, '').slice(0, 60)}`;
+  for (const offer of offers) {
+    const key = offer.code
+      ? `code:${offer.code.toUpperCase()}`
+      : `deal:${offer.title.toLowerCase().replace(/[^a-z0-9%$ ]/g, '').slice(0, 60)}`;
+    const incoming = withSource(offer);
     const prev = byKey.get(key);
-    if (!prev || (o.sourceVerified && !prev.sourceVerified) || (o.description && !prev.description)) {
-      if (prev) o.corroborated = true;
-      byKey.set(key, o);
-    } else {
-      prev.corroborated = true;
+    if (!prev) {
+      byKey.set(key, { ...offer, telemetry: incoming });
+      continue;
     }
+    // Keep the richer presentation, but always pool the evidence.
+    const preferIncoming =
+      (offer.sourceVerified && !prev.sourceVerified) || (offer.description && !prev.description);
+    const winner = preferIncoming ? { ...offer } : prev;
+    winner.telemetry = mergeTelemetry(prev.telemetry, incoming);
+    winner.corroborated = true;
+    byKey.set(key, winner);
   }
 
-  return { offers: assignStatus([...byKey.values()]), errors };
+  const nowMs = Date.now();
+  const scored = [...byKey.values()].map((offer) => {
+    const { confidence, band, evidence, lastWorkedAt, sourceCount } = scoreOffer(offer, nowMs);
+    return {
+      ...offer,
+      confidence,
+      band,
+      evidence,
+      lastWorkedAt,
+      sourceCount,
+      attempts: offer.telemetry?.attempts ?? 0,
+      successes: offer.telemetry?.successes ?? 0,
+      status: statusFromBand(band),
+    };
+  });
+
+  return { offers: scored, errors };
 }

@@ -51,6 +51,12 @@ export async function scrape(domain, slug) {
       sourceVerified: Boolean(lastUsed && nowMs - lastUsed < 7 * 24 * 60 * 60 * 1000),
       verifiedAt: lastUsed,
       expiresAt,
+      // lastUsedDate is when a shopper last actually redeemed it.
+      telemetry: {
+        lastSuccessAt: lastUsed,
+        declaredVerified: Boolean(lastUsed && nowMs - lastUsed < 7 * 24 * 60 * 60 * 1000),
+        sources: [name],
+      },
     });
   }
   // The payload repeats objects across chunks; dedupe by title+code.

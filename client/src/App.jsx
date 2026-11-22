@@ -62,7 +62,8 @@ export default function App() {
   };
 
   const codes = result?.offers.filter((o) => o.code) ?? [];
-  const bestPickId = codes.find((o) => o.status === 'verified')?.id ?? null;
+  // Offers arrive ranked by confidence; only crown a code we actually trust.
+  const bestPickId = codes.find((o) => o.band === 'high' || o.band === 'likely')?.id ?? null;
   const deals = result?.offers.filter((o) => !o.code && o.kind !== 'hidden') ?? [];
   const hidden = result?.offers.filter((o) => !o.code && o.kind === 'hidden') ?? [];
   const isFav = company && favorites.some((f) => f.domain === company.domain);

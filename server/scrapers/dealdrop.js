@@ -45,6 +45,16 @@ export async function scrape(domain, slug) {
         sourceUrl: pageUrl,
         sourceVerified: o.verification_status === 'verified',
         verifiedAt: toTs(o.last_verified_at),
+        // success_rate is a percentage of usage_count (e.g. 8.17% of 49).
+        telemetry: {
+          attempts: Number(o.usage_count) || 0,
+          successes: Number(o.usage_count) && Number(o.success_rate)
+            ? Math.round((Number(o.usage_count) * Number(o.success_rate)) / 100)
+            : 0,
+          lastVerifiedAt: toTs(o.last_verified_at),
+          declaredVerified: o.verification_status === 'verified',
+          sources: [name],
+        },
       });
     }
   }
